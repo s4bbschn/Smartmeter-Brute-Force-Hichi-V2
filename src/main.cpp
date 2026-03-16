@@ -542,7 +542,7 @@ void loop() {
             
             // PIN ist korrekt wenn Nachricht DEUTLICH länger wird (mindestens 50 Bytes mehr)
             int difference = messageLength - referenceMessageLength;
-            if (difference > 50) {
+            if (difference > 100) {
                 pinFound = true;
                 mqttLog("*** PIN GEFUNDEN: %04d ***", currentPin);
                 mqttLog("Laenge: %d -> %d Bytes (+%d)", referenceMessageLength, messageLength, difference);
@@ -552,7 +552,7 @@ void loop() {
                 // Fortschritt auf 100% setzen
                 mqttClient.publish(MQTT_TOPIC_PROGRESS, "100.0");
             } else if (difference > 0) {
-                mqttLog("Laenge +%d Bytes (zu wenig, brauche >50)", difference);
+                mqttLog("Laenge +%d Bytes (zu wenig, brauche >100)", difference);
             }
             nextPin();
     }
