@@ -1,0 +1,9 @@
+.pio
+.vscode
+.DS_Store
+*.pyc
+__pycache__
+.env
+
+# Persönliche Konfiguration nicht hochladen!
+src/config.h

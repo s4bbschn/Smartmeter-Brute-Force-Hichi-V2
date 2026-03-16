@@ -1,0 +1,50 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// WiFi Configuration
+#define WIFI_SSID "DEIN_WIFI_SSID"
+#define WIFI_PASSWORD "DEIN_WIFI_PASSWORT"
+
+// MQTT Configuration
+#define MQTT_SERVER "192.168.1.100"  // Deine MQTT Broker IP
+#define MQTT_PORT 1883
+#define MQTT_USER ""  // Optional
+#define MQTT_PASSWORD ""  // Optional
+#define MQTT_CLIENT_ID "hichi-brute-force"
+
+// MQTT Topics
+#define MQTT_TOPIC_STATUS "smartmeter/brute-force/status"
+#define MQTT_TOPIC_CURRENT_PIN "smartmeter/brute-force/current_pin"
+#define MQTT_TOPIC_RESULT "smartmeter/brute-force/result"
+#define MQTT_TOPIC_PROGRESS "smartmeter/brute-force/progress"
+#define MQTT_TOPIC_MESSAGE_LENGTH "smartmeter/brute-force/message_length"
+#define MQTT_TOPIC_DEBUG "smartmeter/brute-force/debug"
+#define MQTT_TOPIC_SET_PIN "smartmeter/brute-force/set_pin"
+#define MQTT_TOPIC_CONTINUE "smartmeter/brute-force/continue"
+
+// Home Assistant Discovery
+#define HA_DISCOVERY_PREFIX "homeassistant"
+#define HA_DEVICE_NAME "Smartmeter Brute Force"
+#define HA_DEVICE_ID "hichi_brute_force"
+
+// Hichi WiFi v2 Hardware Configuration (ESP32-C3)
+#define IR_RX 3   // RX Pin für IR Lesekopf (GPIO3)
+#define IR_TX 1   // TX Pin für IR Pulse (GPIO1)
+
+// PIN Brute Force Configuration
+#define PIN_DIRECTION 1  // 1 = aufwärts, -1 = abwärts
+#define START_PIN 0
+#define MAX_PIN 9999
+#define MIN_PIN 0
+
+// EMH Smartmeter spezifische Einstellungen
+#define SERIAL_BAUD 9600
+#define SERIAL_CONFIG SERIAL_8N1
+
+// Timing Configuration (EMH spezifisch)
+#define PULSE_HIGH_MS 250
+#define PULSE_LOW_MS 250
+#define DIGIT_DELAY_MS 4100
+#define INIT_DELAY_MS 8000
+
+#endif
