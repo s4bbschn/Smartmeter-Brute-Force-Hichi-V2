@@ -9,7 +9,221 @@ static const uint32_t INIT_DELAY_MS       = 500;
 static const uint32_t INIT_PULSE_GAP_MS   = 1000;
 static const int      MIN_PIN             = 0;
 static const int      MAX_PIN             = 9999;
-static const int      LENGTH_DIFF_THRESHOLD = 100;
+
+// --- SML parsing ---
+// Buffer to collect a full SML response
+static const int SML_BUF_SIZE = 2048;
+static uint8_t sml_buf[SML_BUF_SIZE];
+static int sml_buf_len = 0;
+
+// SML escape sequences
+static const uint8_t SML_START[] = {0x1b, 0x1b, 0x1b, 0x1b, 0x01, 0x01, 0x01, 0x01};
+static const uint8_t SML_END[]   = {0x1b, 0x1b, 0x1b, 0x1b, 0x1a};
+
+// OBIS codes we look for
+// 1-0:1.8.0*255 = total energy (kWh)  → 01 00 01 08 00 FF
+// 1-0:16.7.0*255 = current power (W)  → 01 00 10 07 00 FF
+static const uint8_t OBIS_TOTAL_KWH[] = {0x01, 0x00, 0x01, 0x08, 0x00, 0xFF};
+static const uint8_t OBIS_POWER_W[]   = {0x01, 0x00, 0x10, 0x07, 0x00, 0xFF};
+
+// Parsed SML results
+static bool sml_power_valid = false;
+static bool sml_energy_valid = false;
+static double sml_power_w = 0.0;
+static double sml_energy_kwh = 0.0;
+
+// --- SML value extraction ---
+// After an OBIS code in an SML GetListResponse, the structure is:
+//   OBIS (6 bytes) → status (optional) → valTime (optional) → unit (optional) → scaler → value
+// We search for the OBIS pattern, then skip forward to extract the integer value + scaler.
+//
+// SML TL (type-length) byte: upper nibble = type, lower nibble = length
+//   type 0x5 = signed integer, 0x6 = unsigned integer, 0x0 = octet string
+//   For multi-byte length: if bit 4 of nibble is set, length continues.
+//   Simple approach: we parse the TL byte to get the data length.
+
+// Read a signed integer of `len` bytes from buf at offset
+static int64_t sml_read_int(const uint8_t* buf, int offset, int len) {
+  if (len == 0) return 0;
+  int64_t val = (int8_t)buf[offset]; // sign-extend first byte
+  for (int i = 1; i < len; i++) {
+    val = (val << 8) | buf[offset + i];
+  }
+  return val;
+}
+
+// Read an unsigned integer of `len` bytes from buf at offset
+static uint64_t sml_read_uint(const uint8_t* buf, int offset, int len) {
+  if (len == 0) return 0;
+  uint64_t val = 0;
+  for (int i = 0; i < len; i++) {
+    val = (val << 8) | buf[offset + i];
+  }
+  return val;
+}
+
+// Get length from SML TL byte. Returns data length (excluding TL byte itself).
+// For simple single-byte TL: lower nibble is total field length including TL byte.
+// So data length = (tl & 0x0F) - 1.
+// For type 0x00 with length 0x01 → "optional empty" (SML_SKIP).
+// Returns -1 on error.
+static int sml_tl_data_len(uint8_t tl) {
+  int total_len = tl & 0x0F;
+  if (total_len == 0) return -1;
+  return total_len - 1;
+}
+
+// Skip one SML field at buf[offset], return new offset after the field.
+// Returns -1 on error.
+static int sml_skip_field(const uint8_t* buf, int buf_len, int offset) {
+  if (offset >= buf_len) return -1;
+  uint8_t tl = buf[offset];
+
+  // SML list (type 7): lower nibble = number of list elements
+  if ((tl & 0xF0) == 0x70) {
+    int count = tl & 0x0F;
+    offset++;
+    for (int i = 0; i < count; i++) {
+      offset = sml_skip_field(buf, buf_len, offset);
+      if (offset < 0) return -1;
+    }
+    return offset;
+  }
+
+  // Optional/empty field: 0x01 means "optional not present"
+  if (tl == 0x01) {
+    return offset + 1;
+  }
+
+  // Multi-byte length: bit 4 of upper nibble set means length continues
+  // For simplicity handle the common 2-byte TL case
+  if (tl & 0x80) {
+    // Extended TL: first byte has partial length, second byte continues
+    if (offset + 1 >= buf_len) return -1;
+    int total_len = ((tl & 0x0F) << 4) | (buf[offset + 1] & 0x0F);
+    return offset + total_len;  // total_len includes TL bytes
+  }
+
+  int total_len = tl & 0x0F;
+  if (total_len == 0) return -1;
+  return offset + total_len;
+}
+
+// Extract value after OBIS code match.
+// In SML GetList, after the OBIS octet string, the valListEntry is a list of:
+//   objName, status, valTime, unit, scaler, value, valueSignature
+// We already matched objName (OBIS). Now we need to skip status, valTime, unit,
+// read scaler, read value.
+static bool sml_extract_value_after_obis(const uint8_t* buf, int buf_len, int offset,
+                                          int8_t &scaler_out, int64_t &value_out) {
+  // Skip status
+  offset = sml_skip_field(buf, buf_len, offset);
+  if (offset < 0) return false;
+
+  // Skip valTime
+  offset = sml_skip_field(buf, buf_len, offset);
+  if (offset < 0) return false;
+
+  // Skip unit
+  offset = sml_skip_field(buf, buf_len, offset);
+  if (offset < 0) return false;
+
+  // Read scaler (signed int8)
+  if (offset >= buf_len) return false;
+  uint8_t scaler_tl = buf[offset];
+  int scaler_len = sml_tl_data_len(scaler_tl);
+  if (scaler_len < 0 || scaler_len == 0) {
+    // Optional empty scaler → default 0
+    scaler_out = 0;
+    offset++;
+  } else {
+    offset++;
+    if (offset + scaler_len > buf_len) return false;
+    scaler_out = (int8_t)sml_read_int(buf, offset, scaler_len);
+    offset += scaler_len;
+  }
+
+  // Read value (signed or unsigned integer)
+  if (offset >= buf_len) return false;
+  uint8_t val_tl = buf[offset];
+  uint8_t val_type = (val_tl & 0xF0) >> 4;
+  int val_len = sml_tl_data_len(val_tl);
+  if (val_len <= 0) return false;
+  offset++;
+  if (offset + val_len > buf_len) return false;
+
+  if (val_type == 5) {
+    // Signed integer
+    value_out = sml_read_int(buf, offset, val_len);
+  } else if (val_type == 6) {
+    // Unsigned integer
+    value_out = (int64_t)sml_read_uint(buf, offset, val_len);
+  } else {
+    return false; // unexpected type
+  }
+
+  return true;
+}
+
+// Find OBIS code pattern in buffer and extract the associated value.
+static bool sml_find_obis_value(const uint8_t* buf, int buf_len,
+                                 const uint8_t* obis, int obis_len,
+                                 double &result) {
+  // Search for the OBIS code as a raw byte pattern preceded by its TL byte (0x77 list + 0x07 octet string 6 bytes)
+  for (int i = 0; i < buf_len - obis_len - 1; i++) {
+    // OBIS is typically encoded as octet-string with TL = 0x07 (type 0, length 7 → 6 data bytes)
+    if (buf[i] == 0x07 && i + 1 + obis_len <= buf_len) {
+      if (memcmp(&buf[i + 1], obis, obis_len) == 0) {
+        // Found OBIS code. The value fields follow after the OBIS field.
+        int after_obis = i + 1 + obis_len;
+        int8_t scaler = 0;
+        int64_t value = 0;
+        if (sml_extract_value_after_obis(buf, buf_len, after_obis, scaler, value)) {
+          result = (double)value * pow(10.0, (double)scaler);
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// Parse the collected SML buffer. Returns true if both power and energy were found.
+static bool sml_parse() {
+  sml_power_valid = false;
+  sml_energy_valid = false;
+
+  if (sml_buf_len < 16) return false; // too short for any valid SML
+
+  // Check for SML start sequence
+  bool has_start = false;
+  for (int i = 0; i <= sml_buf_len - 8; i++) {
+    if (memcmp(&sml_buf[i], SML_START, 8) == 0) {
+      has_start = true;
+      break;
+    }
+  }
+  if (!has_start) return false;
+
+  // Try to extract power (W)
+  double power = 0.0;
+  if (sml_find_obis_value(sml_buf, sml_buf_len, OBIS_POWER_W, 6, power)) {
+    sml_power_w = power;
+    sml_power_valid = true;
+  }
+
+  // Try to extract total energy (kWh) — value is typically in Wh, convert
+  double energy = 0.0;
+  if (sml_find_obis_value(sml_buf, sml_buf_len, OBIS_TOTAL_KWH, 6, energy)) {
+    // Check if value seems to be in Wh (> 1000) and convert to kWh
+    // The scaler already handles the unit, but meters often report in Wh with scaler -1 or 0
+    // We'll store the raw scaled value; the scaler from the SML message handles it
+    sml_energy_kwh = energy;
+    sml_energy_valid = true;
+  }
+
+  return sml_power_valid && sml_energy_valid;
+}
 
 // --- Top-level state machine ---
 enum BruteState {
@@ -18,7 +232,7 @@ enum BruteState {
   STATE_WAIT_AFTER_REF,
   STATE_SEND_PIN,
   STATE_WAIT_FOR_RESPONSE,
-  STATE_MEASURE_RESPONSE,
+  STATE_COLLECT_SML,
   STATE_WAIT_BEFORE_NEXT,
   STATE_CHECK_RESULT,
   STATE_FOUND,
@@ -27,26 +241,25 @@ enum BruteState {
 // --- Sub-state machine for non-blocking PIN sending ---
 enum SendState {
   SEND_IDLE,
-  SEND_PRE_DELAY,        // 800ms before first init pulse
-  SEND_INIT_PULSE1_HIGH, // IR on
-  SEND_INIT_PULSE1_LOW,  // IR off
-  SEND_INIT_GAP,         // gap between init pulses
+  SEND_PRE_DELAY,
+  SEND_INIT_PULSE1_HIGH,
+  SEND_INIT_PULSE1_LOW,
+  SEND_INIT_GAP,
   SEND_INIT_PULSE2_HIGH,
   SEND_INIT_PULSE2_LOW,
-  SEND_INIT_DELAY,       // delay after init
-  SEND_DIGIT_PULSE_HIGH, // digit pulse IR on
-  SEND_DIGIT_PULSE_LOW,  // digit pulse IR off
-  SEND_DIGIT_GAP,        // gap between digits
+  SEND_INIT_DELAY,
+  SEND_DIGIT_PULSE_HIGH,
+  SEND_DIGIT_PULSE_LOW,
+  SEND_DIGIT_GAP,
   SEND_DONE,
 };
 
-// --- Sub-state machine for non-blocking measurement ---
-enum MeasureState {
-  MEAS_IDLE,
-  MEAS_WAIT_DATA,    // waiting for first byte (up to 5s)
-  MEAS_READ_DATA,    // reading bytes (up to 12s, 500ms idle = done)
-  MEAS_ATTEMPT_DONE, // short pause between attempts
-  MEAS_DONE,
+// --- Sub-state machine for SML collection ---
+enum CollectState {
+  COLLECT_IDLE,
+  COLLECT_WAIT_DATA,
+  COLLECT_READ_DATA,
+  COLLECT_DONE,
 };
 
 // --- Top-level state ---
@@ -57,20 +270,14 @@ static unsigned long state_timer = 0;
 static SendState send_state = SEND_IDLE;
 static unsigned long send_timer = 0;
 static int send_digits[4] = {0};
-static int send_digit_idx = 0;   // which digit (0-3)
-static int send_pulse_idx = 0;   // which pulse within digit
+static int send_digit_idx = 0;
+static int send_pulse_idx = 0;
 static int send_current_pin = 0;
 
-// --- Measure sub-state ---
-static MeasureState meas_state = MEAS_IDLE;
-static unsigned long meas_timer = 0;
-static unsigned long meas_last_byte = 0;
-static int meas_attempt = 0;
-static int meas_current_len = 0;
-static int meas_max_len = 0;
-static bool meas_any_data_ever = false;
-static bool meas_is_reference = false;
-static const int MEAS_MAX_ATTEMPTS = 5;
+// --- Collect sub-state ---
+static CollectState collect_state = COLLECT_IDLE;
+static unsigned long collect_timer = 0;
+static unsigned long collect_last_byte = 0;
 
 // --- Helper: publish debug + log ---
 static void brute_log(const char* fmt, ...) {
@@ -109,7 +316,7 @@ static void advance_pin() {
 }
 
 // =====================================================
-// Non-blocking PIN sender
+// Non-blocking PIN sender (unchanged logic)
 // =====================================================
 static void send_start(int pin) {
   send_current_pin = pin;
@@ -127,7 +334,6 @@ static void send_start(int pin) {
 
 static bool send_tick() {
   switch (send_state) {
-
     case SEND_IDLE:
       return true;
 
@@ -182,7 +388,6 @@ static bool send_tick() {
         send_digit_idx = 0;
         send_pulse_idx = 0;
         if (send_digits[0] == 0) {
-          // digit 0 = no pulses, just wait the digit gap
           send_timer = millis();
           send_state = SEND_DIGIT_GAP;
         } else {
@@ -205,12 +410,10 @@ static bool send_tick() {
       if (millis() - send_timer >= PULSE_LOW_MS) {
         send_pulse_idx++;
         if (send_pulse_idx < send_digits[send_digit_idx]) {
-          // more pulses for this digit
           id(ir_led).turn_on();
           send_timer = millis();
           send_state = SEND_DIGIT_PULSE_HIGH;
         } else {
-          // digit done, wait gap
           send_timer = millis();
           send_state = SEND_DIGIT_GAP;
         }
@@ -248,113 +451,65 @@ static bool send_tick() {
 }
 
 // =====================================================
-// Non-blocking message length measurement
+// Non-blocking SML data collector
+// Collects bytes into sml_buf until 500ms idle or buffer full.
 // =====================================================
-static void meas_start(bool is_reference) {
-  meas_is_reference = is_reference;
-  meas_attempt = 0;
-  meas_max_len = 0;
-  meas_any_data_ever = false;
-  meas_current_len = 0;
-  brute_log("=== Starte Messung%s ===", is_reference ? " (Referenz)" : "");
-  // Begin first attempt
-  meas_state = MEAS_WAIT_DATA;
-  meas_timer = millis();
-  brute_log("Versuch %d", meas_attempt + 1);
+static void collect_start() {
+  sml_buf_len = 0;
+  collect_state = COLLECT_WAIT_DATA;
+  collect_timer = millis();
+  brute_log("Sammle SML-Daten...");
 }
 
-// Returns true when measurement is complete. Result in meas_max_len.
-static bool meas_tick() {
+// Returns true when collection is complete. Data in sml_buf / sml_buf_len.
+static bool collect_tick() {
   auto &uart = id(ir_uart);
   uint8_t byte_buf;
 
-  switch (meas_state) {
-
-    case MEAS_IDLE:
+  switch (collect_state) {
+    case COLLECT_IDLE:
       return true;
 
-    case MEAS_WAIT_DATA:
-      // Poll for first byte, up to 5s
+    case COLLECT_WAIT_DATA:
       if (uart.available()) {
-        // Got first byte — start reading
         uart.read_byte(&byte_buf);
-        meas_current_len = 1;
-        meas_any_data_ever = true;
-        meas_last_byte = millis();
-        meas_timer = millis();  // reuse as read start
-        meas_state = MEAS_READ_DATA;
-      } else if (millis() - meas_timer >= 5000) {
-        brute_log("  Versuch %d: Timeout, keine Daten", meas_attempt + 1);
-        if (!meas_any_data_ever) {
-          brute_log("Keine Daten empfangen, breche ab");
-          meas_state = MEAS_DONE;
-        } else {
-          // Try next attempt
-          meas_attempt++;
-          if (meas_attempt >= MEAS_MAX_ATTEMPTS) {
-            meas_state = MEAS_DONE;
-          } else {
-            meas_timer = millis();
-            meas_state = MEAS_ATTEMPT_DONE;
-          }
+        if (sml_buf_len < SML_BUF_SIZE) {
+          sml_buf[sml_buf_len++] = byte_buf;
         }
+        collect_last_byte = millis();
+        collect_state = COLLECT_READ_DATA;
+      } else if (millis() - collect_timer >= 8000) {
+        brute_log("Timeout: keine SML-Daten empfangen");
+        collect_state = COLLECT_DONE;
       }
       return false;
 
-    case MEAS_READ_DATA:
-      // Read all available bytes (non-blocking drain)
+    case COLLECT_READ_DATA:
       while (uart.available()) {
         uart.read_byte(&byte_buf);
-        meas_current_len++;
-        meas_last_byte = millis();
+        if (sml_buf_len < SML_BUF_SIZE) {
+          sml_buf[sml_buf_len++] = byte_buf;
+        }
+        collect_last_byte = millis();
       }
       // 500ms idle → message complete
-      if (millis() - meas_last_byte > 500) {
-        if (meas_current_len > meas_max_len) {
-          meas_max_len = meas_current_len;
-        }
-        brute_log("Versuch %d: %d Bytes", meas_attempt + 1, meas_current_len);
-        meas_attempt++;
-        if (meas_attempt >= MEAS_MAX_ATTEMPTS) {
-          meas_state = MEAS_DONE;
-        } else {
-          meas_timer = millis();
-          meas_state = MEAS_ATTEMPT_DONE;
-        }
+      if (millis() - collect_last_byte > 500) {
+        brute_log("SML-Daten: %d Bytes empfangen", sml_buf_len);
+        collect_state = COLLECT_DONE;
       }
-      // Also enforce 12s max read time
-      if (millis() - meas_timer > 12000) {
-        if (meas_current_len > meas_max_len) {
-          meas_max_len = meas_current_len;
-        }
-        brute_log("Versuch %d: %d Bytes (Timeout)", meas_attempt + 1, meas_current_len);
-        meas_attempt++;
-        if (meas_attempt >= MEAS_MAX_ATTEMPTS) {
-          meas_state = MEAS_DONE;
-        } else {
-          meas_timer = millis();
-          meas_state = MEAS_ATTEMPT_DONE;
-        }
+      // 15s max read time
+      if (millis() - collect_timer > 15000) {
+        brute_log("SML-Daten: %d Bytes (Timeout)", sml_buf_len);
+        collect_state = COLLECT_DONE;
       }
       return false;
 
-    case MEAS_ATTEMPT_DONE:
-      // 200ms pause between attempts
-      if (millis() - meas_timer >= 200) {
-        meas_current_len = 0;
-        brute_log("Versuch %d", meas_attempt + 1);
-        meas_timer = millis();
-        meas_state = MEAS_WAIT_DATA;
-      }
-      return false;
-
-    case MEAS_DONE:
-      brute_log("=== Maximum: %d Bytes ===", meas_max_len);
-      meas_state = MEAS_IDLE;
+    case COLLECT_DONE:
+      collect_state = COLLECT_IDLE;
       return true;
 
     default:
-      meas_state = MEAS_IDLE;
+      collect_state = COLLECT_IDLE;
       return true;
   }
 }
@@ -364,11 +519,9 @@ static bool meas_tick() {
 // =====================================================
 enum TestState {
   TEST_IDLE,
-  TEST_MEASURE_REF,
-  TEST_WAIT_AFTER_REF,
   TEST_SEND_PIN,
   TEST_WAIT_FOR_RESPONSE,
-  TEST_MEASURE_RESPONSE,
+  TEST_COLLECT_SML,
   TEST_CHECK_RESULT,
   TEST_DONE,
 };
@@ -381,7 +534,7 @@ static void smartmeter_test_pin_loop() {
     if (test_state != TEST_IDLE) {
       test_state = TEST_IDLE;
       send_state = SEND_IDLE;
-      meas_state = MEAS_IDLE;
+      collect_state = COLLECT_IDLE;
       id(ir_led).turn_off();
     }
     return;
@@ -389,38 +542,16 @@ static void smartmeter_test_pin_loop() {
 
   // Kick off
   if (test_state == TEST_IDLE) {
-    id(status_sensor).publish_state("Einzeltest: Messe Referenz...");
-    meas_start(true);
-    test_state = TEST_MEASURE_REF;
-    return;
+    test_state = TEST_SEND_PIN;
   }
 
   switch (test_state) {
-
-    case TEST_MEASURE_REF: {
-      if (meas_tick()) {
-        id(reference_msg_length) = meas_max_len;
-        brute_log("Einzeltest Referenz: %d Bytes", meas_max_len);
-        id(status_sensor).publish_state("Referenz: " + to_string(meas_max_len) + " Bytes");
-        test_timer = millis();
-        test_state = TEST_WAIT_AFTER_REF;
-      }
-      break;
-    }
-
-    case TEST_WAIT_AFTER_REF: {
-      if (millis() - test_timer >= 3000) {
-        test_state = TEST_SEND_PIN;
-      }
-      break;
-    }
-
     case TEST_SEND_PIN: {
       int pin = id(test_single_pin);
       id(current_pin_sensor).publish_state(pin);
 
       char msg[80];
-      snprintf(msg, sizeof(msg), "Einzeltest: Sende PIN %04d (Ref: %d Bytes)", pin, id(reference_msg_length));
+      snprintf(msg, sizeof(msg), "Einzeltest: Sende PIN %04d", pin);
       id(status_sensor).publish_state(msg);
 
       send_start(pin);
@@ -432,38 +563,43 @@ static void smartmeter_test_pin_loop() {
       if (send_tick()) {
         brute_log("Einzeltest: Warte 5s auf Antwort...");
         test_timer = millis();
-        test_state = TEST_MEASURE_RESPONSE;
+        test_state = TEST_COLLECT_SML;
       }
       break;
     }
 
-    case TEST_MEASURE_RESPONSE: {
+    case TEST_COLLECT_SML: {
       if (millis() - test_timer < 5000) break;
-      if (meas_state == MEAS_IDLE) {
-        meas_start(false);
+      if (collect_state == COLLECT_IDLE) {
+        collect_start();
       }
-      if (meas_tick()) {
+      if (collect_tick()) {
         test_state = TEST_CHECK_RESULT;
       }
       break;
     }
 
     case TEST_CHECK_RESULT: {
-      int msg_len = meas_max_len;
-      id(message_length_sensor).publish_state(msg_len);
+      id(message_length_sensor).publish_state(sml_buf_len);
 
-      int diff = msg_len - id(reference_msg_length);
-      brute_log("Einzeltest: Länge %d Bytes (Ref: %d, Diff: %d)", msg_len, id(reference_msg_length), diff);
+      bool parsed = sml_parse();
+      char result[120];
 
-      char result[100];
-      if (diff > LENGTH_DIFF_THRESHOLD) {
-        snprintf(result, sizeof(result), "PIN %04d: TREFFER! +%d Bytes", id(test_single_pin), diff);
+      if (parsed) {
+        snprintf(result, sizeof(result), "PIN %04d: TREFFER! Leistung: %.1f W, Zähler: %.1f kWh",
+                 id(test_single_pin), sml_power_w, sml_energy_kwh);
         id(result_sensor).publish_state(result);
-        id(status_sensor).publish_state("Einzeltest: PIN könnte korrekt sein!");
+        id(status_sensor).publish_state("Einzeltest: PIN korrekt! SML-Daten gelesen.");
+        id(power_sensor).publish_state(sml_power_w);
+        id(energy_sensor).publish_state(sml_energy_kwh);
       } else {
-        snprintf(result, sizeof(result), "PIN %04d: Kein Treffer (Diff: %d)", id(test_single_pin), diff);
+        snprintf(result, sizeof(result), "PIN %04d: Kein SML (Leistung: %s, Zähler: %s, %d Bytes)",
+                 id(test_single_pin),
+                 sml_power_valid ? "ja" : "nein",
+                 sml_energy_valid ? "ja" : "nein",
+                 sml_buf_len);
         id(result_sensor).publish_state(result);
-        id(status_sensor).publish_state("Einzeltest: PIN nicht korrekt");
+        id(status_sensor).publish_state("Einzeltest: PIN nicht korrekt (kein gültiges SML)");
       }
 
       test_state = TEST_DONE;
@@ -483,10 +619,10 @@ static void smartmeter_test_pin_loop() {
 }
 
 // =====================================================
-// Main loop — called every 100ms from ESPHome interval
+// Main brute-force loop — called every 50ms from ESPHome interval
 // =====================================================
 void smartmeter_brute_loop() {
-  // Single-pin test takes priority over brute force
+  // Single-pin test takes priority
   if (id(test_single_running) || test_state != TEST_IDLE) {
     smartmeter_test_pin_loop();
     return;
@@ -497,11 +633,11 @@ void smartmeter_brute_loop() {
     return;
   }
 
-  // Just started → kick off reference measurement
+  // Just started → begin with first PIN directly (no reference measurement needed)
   if (id(brute_force_running) && brute_state == STATE_IDLE) {
-    id(status_sensor).publish_state("Messe Referenz-Nachrichtenlänge...");
-    meas_start(true);
-    brute_state = STATE_MEASURE_REF;
+    id(status_sensor).publish_state("Brute-Force gestartet (SML-Erkennung)");
+    brute_log("Starte Brute-Force mit SML-Parsing ab PIN %04d", id(current_pin));
+    brute_state = STATE_SEND_PIN;
     return;
   }
 
@@ -509,36 +645,12 @@ void smartmeter_brute_loop() {
   if (!id(brute_force_running) && brute_state != STATE_FOUND) {
     brute_state = STATE_IDLE;
     send_state = SEND_IDLE;
-    meas_state = MEAS_IDLE;
+    collect_state = COLLECT_IDLE;
     id(ir_led).turn_off();
     return;
   }
 
   switch (brute_state) {
-
-    case STATE_MEASURE_REF: {
-      if (meas_tick()) {
-        id(reference_msg_length) = meas_max_len;
-        brute_log("Referenzlänge: %d Bytes", meas_max_len);
-        id(status_sensor).publish_state("Referenz: " + to_string(meas_max_len) + " Bytes");
-        if (meas_max_len == 0) {
-          brute_log("WARNUNG: Keine UART-Daten! Teste trotzdem...");
-        }
-        brute_log("Starte in 3 Sekunden...");
-        state_timer = millis();
-        brute_state = STATE_WAIT_AFTER_REF;
-      }
-      break;
-    }
-
-    case STATE_WAIT_AFTER_REF: {
-      if (millis() - state_timer >= 3000) {
-        id(status_sensor).publish_state("Brute-Force läuft...");
-        brute_state = STATE_SEND_PIN;
-      }
-      break;
-    }
-
     case STATE_SEND_PIN: {
       if (id(pin_found)) {
         brute_state = STATE_FOUND;
@@ -550,61 +662,59 @@ void smartmeter_brute_loop() {
       publish_progress(pin);
 
       char msg[80];
-      snprintf(msg, sizeof(msg), "Teste PIN %04d (Ref: %d Bytes)", pin, id(reference_msg_length));
+      snprintf(msg, sizeof(msg), "Teste PIN %04d", pin);
       id(status_sensor).publish_state(msg);
 
-      // Start non-blocking send
       send_start(pin);
       brute_state = STATE_WAIT_FOR_RESPONSE;
       break;
     }
 
     case STATE_WAIT_FOR_RESPONSE: {
-      // Tick the sender until done
       if (send_tick()) {
-        // PIN fully sent — wait 5s for meter to respond
         brute_log("Warte 5s auf Antwort...");
         state_timer = millis();
-        brute_state = STATE_MEASURE_RESPONSE;
+        brute_state = STATE_COLLECT_SML;
       }
       break;
     }
 
-    case STATE_MEASURE_RESPONSE: {
-      // Wait 5s, then start measurement
-      if (millis() - state_timer < 5000) {
-        break;
+    case STATE_COLLECT_SML: {
+      if (millis() - state_timer < 5000) break;
+      if (collect_state == COLLECT_IDLE) {
+        collect_start();
       }
-      // Kick off measurement (only once)
-      if (meas_state == MEAS_IDLE) {
-        meas_start(false);
-      }
-      if (meas_tick()) {
+      if (collect_tick()) {
         brute_state = STATE_CHECK_RESULT;
       }
       break;
     }
 
     case STATE_CHECK_RESULT: {
-      int msg_len = meas_max_len;
-      id(message_length_sensor).publish_state(msg_len);
+      id(message_length_sensor).publish_state(sml_buf_len);
 
-      int diff = msg_len - id(reference_msg_length);
-      brute_log("Länge: %d Bytes (Ref: %d, Diff: %d)", msg_len, id(reference_msg_length), diff);
+      bool parsed = sml_parse();
 
-      if (diff > LENGTH_DIFF_THRESHOLD) {
+      if (parsed) {
         id(pin_found) = true;
         brute_log("*** PIN GEFUNDEN: %04d ***", id(current_pin));
+        brute_log("Leistung: %.1f W, Zählerstand: %.1f kWh", sml_power_w, sml_energy_kwh);
 
-        char result[60];
-        snprintf(result, sizeof(result), "PIN gefunden: %04d", id(current_pin));
+        char result[100];
+        snprintf(result, sizeof(result), "PIN %04d: %.1f W, %.1f kWh",
+                 id(current_pin), sml_power_w, sml_energy_kwh);
         id(result_sensor).publish_state(result);
-        id(status_sensor).publish_state("PIN erfolgreich gefunden!");
+        id(status_sensor).publish_state("PIN gefunden! SML-Daten erfolgreich gelesen.");
         id(progress_sensor).publish_state(100.0f);
+        id(power_sensor).publish_state(sml_power_w);
+        id(energy_sensor).publish_state(sml_energy_kwh);
         brute_state = STATE_FOUND;
       } else {
-        if (diff > 0) {
-          brute_log("+%d Bytes (zu wenig, brauche >%d)", diff, LENGTH_DIFF_THRESHOLD);
+        if (sml_buf_len > 0) {
+          brute_log("PIN %04d: %d Bytes, kein gültiges SML (P:%s E:%s)",
+                    id(current_pin), sml_buf_len,
+                    sml_power_valid ? "ja" : "nein",
+                    sml_energy_valid ? "ja" : "nein");
         }
         advance_pin();
         state_timer = millis();

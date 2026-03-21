@@ -74,10 +74,6 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
-  - id: reference_msg_length
-    type: int
-    restore_value: no
-    initial_value: '0'
   - id: brute_force_running
     type: bool
     restore_value: no
@@ -120,6 +116,20 @@ sensor:
     unit_of_measurement: "Bytes"
     accuracy_decimals: 0
     icon: "mdi:file-document"
+
+  - platform: template
+    name: "Leistung"
+    id: power_sensor
+    unit_of_measurement: "W"
+    accuracy_decimals: 1
+    icon: "mdi:flash"
+
+  - platform: template
+    name: "Zählerstand"
+    id: energy_sensor
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 1
+    icon: "mdi:counter"
 
   - platform: wifi_signal
     name: "WiFi Signal"
@@ -174,6 +184,35 @@ number:
           id(test_single_pin) = (int)x;
           ESP_LOGI("brute", "Test-PIN gesetzt auf: %04d", (int)x);
 
+text:
+  - platform: template
+    name: "Test PIN Text"
+    id: test_pin_text_input
+    mode: text
+    icon: "mdi:key-variant"
+    optimistic: true
+    min_length: 1
+    max_length: 4
+    set_action:
+      - lambda: |-
+          // Validate: only digits, max 4 chars
+          std::string pin_str = x;
+          for (char c : pin_str) {
+            if (c < '0' || c > '9') {
+              ESP_LOGW("brute", "Ungültige Eingabe: %s", pin_str.c_str());
+              return;
+            }
+          }
+          // Pad to 4 digits with leading zeros
+          while (pin_str.length() < 4) pin_str = "0" + pin_str;
+          int pin_val = atoi(pin_str.c_str());
+          if (pin_val > 9999) {
+            ESP_LOGW("brute", "PIN zu groß: %s", pin_str.c_str());
+            return;
+          }
+          id(test_single_pin) = pin_val;
+          ESP_LOGI("brute", "Test-PIN gesetzt auf: %s", pin_str.c_str());
+
 # --- Buttons ---
 button:
   - platform: template
@@ -202,8 +241,10 @@ button:
             return;
           }
           id(test_single_running) = true;
-          ESP_LOGI("brute", "Starte Einzeltest für PIN %04d", id(test_single_pin));
-          id(status_sensor).publish_state("Einzeltest PIN " + to_string(id(test_single_pin)));
+          char pin_buf[5];
+          snprintf(pin_buf, sizeof(pin_buf), "%04d", id(test_single_pin));
+          ESP_LOGI("brute", "Starte Einzeltest für PIN %s", pin_buf);
+          id(status_sensor).publish_state(std::string("Einzeltest PIN ") + pin_buf);
 
   - platform: template
     name: "Start Brute Force"
