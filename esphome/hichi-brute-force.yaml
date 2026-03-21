@@ -1,0 +1,276 @@
+substitutions:
+  device_name: hichi-brute-force
+  friendly_name: "Smartmeter Brute Force"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  includes:
+    - smartmeter_bruteforce.h
+
+# --- Board: pick ONE of these blocks and comment out the others ---
+
+# ESP32-C3 (default HiChi WiFi v2)
+# esp32:
+#   board: esp32-c3-devkitm-1
+#   framework:
+#     type: arduino
+
+# ESP32-WROOM
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# # ESP8266 (D1 Mini)
+# esp8266:
+#   board: d1_mini
+
+# --- WiFi ---
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name}-fallback"
+    password: "fallback123"
+
+captive_portal:
+
+# --- Logging & OTA ---
+logger:
+  baud_rate: 0  # disable UART logging so it doesn't interfere with IR serial
+
+ota:
+  - platform: esphome
+    password: "brute123"
+
+api:
+  # Native Home Assistant API — no MQTT needed
+
+web_server:
+  port: 80
+
+# --- UART for IR read head ---
+uart:
+  id: ir_uart
+  rx_pin: GPIO14    # ESP32-C3 default; change for WROOM (GPIO14) or ESP8266 (GPIO3)
+  tx_pin: GPIO25   # not used for sending, but UART needs it defined
+  baud_rate: 9600
+  data_bits: 8
+  stop_bits: 1
+  parity: NONE
+
+# --- Globals for brute-force state ---
+globals:
+  - id: current_pin
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: pin_direction
+    type: int
+    restore_value: no
+    initial_value: '1'
+  - id: pin_found
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: brute_force_running
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: test_single_pin
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: test_single_running
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# --- Output pin for IR TX LED (active LOW / inverted) ---
+output:
+  - platform: gpio
+    pin:
+      number: GPIO13   # ESP32-C3 default; change for WROOM (GPIO13) or ESP8266 (GPIO1)
+      inverted: true
+    id: ir_led
+
+# --- Sensors exposed to Home Assistant ---
+sensor:
+  - platform: template
+    name: "Aktueller PIN"
+    id: current_pin_sensor
+    accuracy_decimals: 0
+    icon: "mdi:numeric"
+
+  - platform: template
+    name: "Fortschritt"
+    id: progress_sensor
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    icon: "mdi:progress-clock"
+
+  - platform: template
+    name: "Nachrichtenlänge"
+    id: message_length_sensor
+    unit_of_measurement: "Bytes"
+    accuracy_decimals: 0
+    icon: "mdi:file-document"
+
+  - platform: template
+    name: "Leistung"
+    id: power_sensor
+    unit_of_measurement: "W"
+    accuracy_decimals: 1
+    icon: "mdi:flash"
+
+  - platform: template
+    name: "Zählerstand"
+    id: energy_sensor
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 1
+    icon: "mdi:counter"
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+text_sensor:
+  - platform: template
+    name: "Status"
+    id: status_sensor
+    icon: "mdi:information"
+
+  - platform: template
+    name: "Ergebnis"
+    id: result_sensor
+    icon: "mdi:check-circle"
+
+  - platform: template
+    name: "Debug Log"
+    id: debug_sensor
+    icon: "mdi:bug"
+
+# --- Number input: set PIN manually from HA ---
+number:
+  - platform: template
+    name: "PIN setzen"
+    id: set_pin_input
+    min_value: 0
+    max_value: 9999
+    step: 1
+    mode: box
+    icon: "mdi:numeric"
+    optimistic: true
+    set_action:
+      - lambda: |-
+          int new_pin = (int)x;
+          id(current_pin) = new_pin;
+          id(pin_found) = false;
+          ESP_LOGI("brute", "PIN manuell gesetzt auf: %04d", new_pin);
+          id(status_sensor).publish_state("PIN manuell gesetzt auf " + to_string(new_pin));
+
+  - platform: template
+    name: "Test PIN"
+    id: test_pin_input
+    min_value: 0
+    max_value: 9999
+    step: 1
+    mode: box
+    icon: "mdi:key-variant"
+    optimistic: true
+    set_action:
+      - lambda: |-
+          id(test_single_pin) = (int)x;
+          ESP_LOGI("brute", "Test-PIN gesetzt auf: %04d", (int)x);
+
+text:
+  - platform: template
+    name: "Test PIN Text"
+    id: test_pin_text_input
+    mode: text
+    icon: "mdi:key-variant"
+    optimistic: true
+    min_length: 1
+    max_length: 4
+    set_action:
+      - lambda: |-
+          // Validate: only digits, max 4 chars
+          std::string pin_str = x;
+          for (char c : pin_str) {
+            if (c < '0' || c > '9') {
+              ESP_LOGW("brute", "Ungültige Eingabe: %s", pin_str.c_str());
+              return;
+            }
+          }
+          // Pad to 4 digits with leading zeros
+          while (pin_str.length() < 4) pin_str = "0" + pin_str;
+          int pin_val = atoi(pin_str.c_str());
+          if (pin_val > 9999) {
+            ESP_LOGW("brute", "PIN zu groß: %s", pin_str.c_str());
+            return;
+          }
+          id(test_single_pin) = pin_val;
+          ESP_LOGI("brute", "Test-PIN gesetzt auf: %s", pin_str.c_str());
+
+# --- Buttons ---
+button:
+  - platform: template
+    name: "Weiter suchen"
+    icon: "mdi:play-circle"
+    on_press:
+      - lambda: |-
+          if (id(pin_found)) {
+            id(pin_found) = false;
+            ESP_LOGI("brute", "False Positive - Suche fortgesetzt");
+            id(status_sensor).publish_state("Suche fortgesetzt (False Positive)");
+          }
+
+  - platform: template
+    name: "Einzeltest PIN"
+    icon: "mdi:test-tube"
+    on_press:
+      - lambda: |-
+          if (id(brute_force_running)) {
+            ESP_LOGW("brute", "Brute-Force läuft, bitte zuerst stoppen!");
+            id(status_sensor).publish_state("Brute-Force läuft, bitte zuerst stoppen!");
+            return;
+          }
+          if (id(test_single_running)) {
+            ESP_LOGW("brute", "Einzeltest läuft bereits!");
+            return;
+          }
+          id(test_single_running) = true;
+          char pin_buf[5];
+          snprintf(pin_buf, sizeof(pin_buf), "%04d", id(test_single_pin));
+          ESP_LOGI("brute", "Starte Einzeltest für PIN %s", pin_buf);
+          id(status_sensor).publish_state(std::string("Einzeltest PIN ") + pin_buf);
+
+  - platform: template
+    name: "Start Brute Force"
+    icon: "mdi:play"
+    on_press:
+      - lambda: |-
+          id(brute_force_running) = true;
+          id(pin_found) = false;
+          ESP_LOGI("brute", "Brute-Force gestartet ab PIN %04d", id(current_pin));
+          id(status_sensor).publish_state("Brute-Force gestartet");
+
+  - platform: template
+    name: "Stop Brute Force"
+    icon: "mdi:stop"
+    on_press:
+      - lambda: |-
+          id(brute_force_running) = false;
+          ESP_LOGI("brute", "Brute-Force gestoppt");
+          id(status_sensor).publish_state("Brute-Force gestoppt");
+
+  - platform: restart
+    name: "Neustart"
+
+# --- Main brute-force loop ---
+interval:
+  - interval: 50ms
+    then:
+      - lambda: |-
+          smartmeter_brute_loop();
