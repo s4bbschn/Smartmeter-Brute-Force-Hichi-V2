@@ -11,10 +11,12 @@ static const int      MIN_PIN             = 0;
 static const int      MAX_PIN             = 9999;
 
 // --- SML parsing ---
-// Buffer to collect a full SML response (multiple messages)
-static const int SML_BUF_SIZE = 4096;
+// Buffer to collect SML response (need at least 2 messages)
+static const int SML_BUF_SIZE = 1024;
 static uint8_t sml_buf[SML_BUF_SIZE];
 static int sml_buf_len = 0;
+// Track how many SML start sequences we've seen
+static int sml_start_count = 0;
 
 // SML escape sequences
 static const uint8_t SML_START[] = {0x1b, 0x1b, 0x1b, 0x1b, 0x01, 0x01, 0x01, 0x01};
@@ -126,19 +128,17 @@ static int sml_skip_field(const uint8_t* buf, int buf_len, int offset) {
 // read scaler, read value.
 static bool sml_extract_value_after_obis(const uint8_t* buf, int buf_len, int offset,
                                           int8_t &scaler_out, int64_t &value_out) {
-  int start_offset = offset;
-
   // Skip status
   offset = sml_skip_field(buf, buf_len, offset);
-  if (offset < 0) { ESP_LOGI("sml", "skip status failed @ %d", start_offset); return false; }
+  if (offset < 0) return false;
 
   // Skip valTime
   offset = sml_skip_field(buf, buf_len, offset);
-  if (offset < 0) { ESP_LOGI("sml", "skip valTime failed @ %d", start_offset); return false; }
+  if (offset < 0) return false;
 
   // Skip unit
   offset = sml_skip_field(buf, buf_len, offset);
-  if (offset < 0) { ESP_LOGI("sml", "skip unit failed @ %d", start_offset); return false; }
+  if (offset < 0) return false;
 
   // Read scaler (signed int8)
   if (offset >= buf_len) return false;
@@ -160,10 +160,7 @@ static bool sml_extract_value_after_obis(const uint8_t* buf, int buf_len, int of
   uint8_t val_tl = buf[offset];
   uint8_t val_type = (val_tl & 0xF0) >> 4;
   int val_len = sml_tl_data_len(val_tl);
-  if (val_len <= 0) {
-    ESP_LOGI("sml", "value TL=0x%02X type=%d len=%d @ %d", val_tl, val_type, val_len, offset);
-    return false;
-  }
+  if (val_len <= 0) return false;
   offset++;
   if (offset + val_len > buf_len) return false;
 
@@ -174,36 +171,24 @@ static bool sml_extract_value_after_obis(const uint8_t* buf, int buf_len, int of
     // Unsigned integer
     value_out = (int64_t)sml_read_uint(buf, offset, val_len);
   } else {
-    ESP_LOGI("sml", "unexpected value type %d @ %d", val_type, offset);
-    return false;
+    return false; // unexpected type
   }
 
   return true;
 }
 
-// Find OBIS code pattern in buffer and extract the associated value.
+// Find OBIS code pattern in buffer starting from search_from, extract value.
 static bool sml_find_obis_value(const uint8_t* buf, int buf_len,
                                  const uint8_t* obis, int obis_len,
-                                 double &result) {
-  for (int i = 0; i < buf_len - obis_len - 1; i++) {
-    // OBIS is encoded as octet-string with TL = 0x07 (type 0, length 7 → 6 data bytes)
+                                 double &result, int search_from = 0) {
+  for (int i = search_from; i < buf_len - obis_len - 1; i++) {
     if (buf[i] == 0x07 && i + 1 + obis_len <= buf_len) {
       if (memcmp(&buf[i + 1], obis, obis_len) == 0) {
         int after_obis = i + 1 + obis_len;
-
-        // Log the 20 bytes after OBIS for debugging
-        char hex[80];
-        int hex_len = 0;
-        for (int j = 0; j < 20 && after_obis + j < buf_len; j++) {
-          hex_len += snprintf(hex + hex_len, sizeof(hex) - hex_len, "%02X ", buf[after_obis + j]);
-        }
-        ESP_LOGI("sml", "OBIS %d.%d.%d @ %d, after: %s", obis[2], obis[3], obis[4], i, hex);
-
         int8_t scaler = 0;
         int64_t value = 0;
         if (sml_extract_value_after_obis(buf, buf_len, after_obis, scaler, value)) {
           result = (double)value * pow(10.0, (double)scaler);
-          ESP_LOGI("sml", "  -> scaler=%d value=%lld result=%.4f", scaler, value, result);
           return true;
         }
       }
@@ -217,56 +202,47 @@ static bool sml_parse() {
   sml_power_valid = false;
   sml_energy_valid = false;
 
-  if (sml_buf_len < 16) return false; // too short for any valid SML
+  if (sml_buf_len < 16) return false;
 
-  // Check for SML start sequence
-  bool has_start = false;
+  // Find the SECOND SML start sequence — the first message is the basic/locked
+  // response that all PINs get. The second message (if present) is the extended
+  // data that only appears with the correct PIN and contains 16.7.0 (power).
+  int second_start = -1;
+  int start_count = 0;
   for (int i = 0; i <= sml_buf_len - 8; i++) {
     if (memcmp(&sml_buf[i], SML_START, 8) == 0) {
-      has_start = true;
-      break;
+      start_count++;
+      if (start_count == 2) {
+        second_start = i;
+        break;
+      }
     }
   }
-  if (!has_start) {
-    ESP_LOGI("sml", "Kein Start-Escape gefunden");
+
+  if (second_start < 0) {
+    // Only one SML message — no extended data, PIN is wrong
     return false;
   }
 
-  // Dump all OBIS codes found in the buffer for debugging
-  for (int i = 0; i < sml_buf_len - 7; i++) {
-    if (sml_buf[i] == 0x07 && sml_buf[i+1] == 0x01 && sml_buf[i+2] == 0x00 && sml_buf[i+6] == 0xFF) {
-      ESP_LOGI("sml", "OBIS: %d-%d:%d.%d.%d*%d @ %d",
-                sml_buf[i+1], sml_buf[i+2], sml_buf[i+3], sml_buf[i+4], sml_buf[i+5], sml_buf[i+6], i);
-    }
-  }
+  ESP_LOGI("sml", "Zweite SML-Nachricht ab Offset %d", second_start);
 
-  // Try to extract power (W) — try multiple OBIS codes
+  // Search for power and energy only in the second message onwards
   double power = 0.0;
-  if (sml_find_obis_value(sml_buf, sml_buf_len, OBIS_POWER_W1, 6, power) ||
-      sml_find_obis_value(sml_buf, sml_buf_len, OBIS_POWER_W2, 6, power) ||
-      sml_find_obis_value(sml_buf, sml_buf_len, OBIS_POWER_W3, 6, power) ||
-      sml_find_obis_value(sml_buf, sml_buf_len, OBIS_POWER_W4, 6, power)) {
+  if (sml_find_obis_value(sml_buf, sml_buf_len, OBIS_POWER_W1, 6, power, second_start) ||
+      sml_find_obis_value(sml_buf, sml_buf_len, OBIS_POWER_W2, 6, power, second_start) ||
+      sml_find_obis_value(sml_buf, sml_buf_len, OBIS_POWER_W3, 6, power, second_start) ||
+      sml_find_obis_value(sml_buf, sml_buf_len, OBIS_POWER_W4, 6, power, second_start)) {
     sml_power_w = power;
     sml_power_valid = true;
-    ESP_LOGI("sml", "Leistung: %.1f W", power);
   }
 
-  // Try to extract total energy (kWh)
   double energy = 0.0;
-  if (sml_find_obis_value(sml_buf, sml_buf_len, OBIS_TOTAL_KWH, 6, energy) ||
-      sml_find_obis_value(sml_buf, sml_buf_len, OBIS_TOTAL_KWH2, 6, energy)) {
+  if (sml_find_obis_value(sml_buf, sml_buf_len, OBIS_TOTAL_KWH, 6, energy, second_start) ||
+      sml_find_obis_value(sml_buf, sml_buf_len, OBIS_TOTAL_KWH2, 6, energy, second_start)) {
     sml_energy_kwh = energy;
     sml_energy_valid = true;
-    ESP_LOGI("sml", "Zähler: %.1f kWh", energy);
   }
 
-  // Require both power and energy for a definitive match.
-  // With the extended 2s collection window, the meter should send
-  // all SML messages including instantaneous power if the PIN is correct.
-  // If only energy is found, log it but don't confirm yet.
-  if (sml_energy_valid && !sml_power_valid) {
-    ESP_LOGI("sml", "Nur Energie gefunden (%.4f), kein Leistungs-OBIS — evtl. gesperrte Antwort", sml_energy_kwh);
-  }
   return sml_power_valid && sml_energy_valid;
 }
 
@@ -497,7 +473,9 @@ static bool send_tick() {
 
 // =====================================================
 // Non-blocking SML data collector
-// Collects bytes into sml_buf until 500ms idle or buffer full.
+// Collects bytes into sml_buf. Stops after 2s idle or buffer full.
+// For wrong PINs: ~364 bytes, 1 message, fast timeout.
+// For correct PINs: multiple messages with 16.7.0 OBIS.
 // =====================================================
 static void collect_start() {
   sml_buf_len = 0;
@@ -537,13 +515,18 @@ static bool collect_tick() {
         }
         collect_last_byte = millis();
       }
-      // 2s idle → all messages complete (meters may pause between SML messages)
-      if (millis() - collect_last_byte > 2000) {
+      // Buffer full → stop
+      if (sml_buf_len >= SML_BUF_SIZE) {
+        brute_log("SML-Daten: %d Bytes (Puffer voll)", sml_buf_len);
+        collect_state = COLLECT_DONE;
+      }
+      // 2s idle → done (wrong PIN: meter stops after 1 msg; correct PIN: gap between msgs is <1s)
+      else if (millis() - collect_last_byte > 2000) {
         brute_log("SML-Daten: %d Bytes empfangen", sml_buf_len);
         collect_state = COLLECT_DONE;
       }
-      // 30s max read time
-      if (millis() - collect_timer > 30000) {
+      // 30s max safety
+      else if (millis() - collect_timer > 30000) {
         brute_log("SML-Daten: %d Bytes (Timeout)", sml_buf_len);
         collect_state = COLLECT_DONE;
       }
