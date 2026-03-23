@@ -10,17 +10,17 @@ esphome:
 
 # --- Board: pick ONE of these blocks and comment out the others ---
 
-# ESP32-C3 (default HiChi WiFi v2)
-# esp32:
-#   board: esp32-c3-devkitm-1
-#   framework:
-#     type: arduino
-
-# ESP32-WROOM
+# ESP32-C3 (HiChi WiFi v2)
 esp32:
-  board: esp32dev
+  board: esp32-c3-devkitm-1
   framework:
     type: arduino
+
+# # ESP32-WROOM
+# esp32:
+#   board: esp32dev
+#   framework:
+#     type: arduino
 
 # # ESP8266 (D1 Mini)
 # esp8266:
@@ -53,8 +53,8 @@ web_server:
 # --- UART for IR read head ---
 uart:
   id: ir_uart
-  rx_pin: GPIO14    # ESP32-C3 default; change for WROOM (GPIO14) or ESP8266 (GPIO3)
-  tx_pin: GPIO25   # not used for sending, but UART needs it defined
+  rx_pin: GPIO3    # Hichi WiFi v2 (ESP32-C3)
+  tx_pin: GPIO1    # Hichi WiFi v2 (ESP32-C3) - für IR Pulse
   baud_rate: 9600
   data_bits: 8
   stop_bits: 1
@@ -91,7 +91,7 @@ globals:
 output:
   - platform: gpio
     pin:
-      number: GPIO13   # ESP32-C3 default; change for WROOM (GPIO13) or ESP8266 (GPIO1)
+      number: GPIO1   # Hichi WiFi v2 (ESP32-C3)
       inverted: true
     id: ir_led
 
